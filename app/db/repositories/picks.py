@@ -156,3 +156,16 @@ class PicksRepository:
             .order_by(DailyPick.pick_date.asc())
         )
         return list(result.scalars().all())
+
+    async def delete_all_for_date(self, pick_date: date) -> int:
+        """
+        Delete ALL picks for a date (for regeneration).
+
+        Returns the number of picks deleted.
+        """
+        picks = await self.get_all_by_date(pick_date)
+        count = len(picks)
+        for pick in picks:
+            await self.session.delete(pick)
+        await self.session.commit()
+        return count

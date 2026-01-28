@@ -29,10 +29,8 @@ async def run_daily_job():
     Main daily job that runs at 9 AM EST.
 
     Steps:
-    1. Update yesterday's game outcomes
-    2. Resolve yesterday's top pick and store outcome with scores
-    3. Clean up non-top picks for yesterday
-    4. Generate today's picks
+    1. Resolve ALL of yesterday's picks and store outcomes with scores
+    2. Generate today's picks
     """
     logger.info("Starting daily job...")
 
@@ -43,9 +41,9 @@ async def run_daily_job():
 
             picks_repo = PicksRepository(session)
 
-            # Step 1 & 2: Resolve yesterday's top pick and store outcome
+            # Step 1: Resolve ALL of yesterday's picks
             logger.info(f"Processing picks for {yesterday}")
-            await resolve_and_cleanup_picks(session, yesterday)
+            await resolve_all_picks(session, yesterday)
 
             # Step 3: Generate today's picks (if not already generated)
             existing_picks = await picks_repo.get_all_by_date(today)
@@ -61,16 +59,15 @@ async def run_daily_job():
             raise
 
 
-async def resolve_and_cleanup_picks(session, pick_date: date):
+async def resolve_all_picks(session, pick_date: date):
     """
-    Resolve the top-edge pick for a date and clean up other picks.
+    Resolve ALL picks for a date and store their outcomes.
 
     Steps:
     1. Get all picks for the date
-    2. Find the top-edge pick
-    3. Fetch game result from ESPN
-    4. Store home_score, away_score, and outcome
-    5. Delete all other picks for this date
+    2. For each pick, fetch game result from ESPN
+    3. Store home_score, away_score, and outcome for each pick
+    4. Keep ALL picks (no deletion) for simulation with all bets
     """
     from app.services.simulation_service import determine_outcome
 
@@ -81,43 +78,51 @@ async def resolve_and_cleanup_picks(session, pick_date: date):
         logger.info(f"No picks found for {pick_date}")
         return
 
-    # Find top-edge pick
-    top_pick = max(picks, key=lambda p: float(p.edge))
-    logger.info(f"Top pick for {pick_date}: {top_pick.side} ({top_pick.bet_type}) with edge {float(top_pick.edge):.1f}%")
+    logger.info(f"Resolving {len(picks)} picks for {pick_date}")
 
-    # Check if already resolved
-    if top_pick.outcome is not None:
-        logger.info(f"Pick already resolved: {top_pick.outcome}")
-        # Still clean up other picks
-        deleted = await picks_repo.delete_picks_for_date_except(pick_date, top_pick.id)
-        logger.info(f"Cleaned up {deleted} non-top picks")
-        return
+    # Cache game results to avoid duplicate ESPN calls for same game
+    game_results_cache = {}
+    resolved_count = 0
 
-    # Fetch game result from ESPN
-    game_result = espn_data_service.get_game_result(top_pick.espn_game_id)
+    for pick in picks:
+        # Skip if already resolved
+        if pick.outcome is not None:
+            logger.debug(f"Pick {pick.id} already resolved: {pick.outcome}")
+            continue
 
-    if not game_result or game_result.get("status") != "final":
-        logger.warning(f"Game not final yet for pick {top_pick.id}")
-        return
+        # Check cache first, then fetch from ESPN
+        if pick.espn_game_id not in game_results_cache:
+            game_result = espn_data_service.get_game_result(pick.espn_game_id)
+            game_results_cache[pick.espn_game_id] = game_result
+        else:
+            game_result = game_results_cache[pick.espn_game_id]
 
-    home_score = game_result.get("home_score")
-    away_score = game_result.get("away_score")
+        if not game_result or game_result.get("status") != "final":
+            logger.warning(f"Game not final yet for pick {pick.id} (game {pick.espn_game_id})")
+            continue
 
-    if home_score is None or away_score is None:
-        logger.warning(f"Scores not available for pick {top_pick.id}")
-        return
+        home_score = game_result.get("home_score")
+        away_score = game_result.get("away_score")
 
-    # Determine outcome
-    outcome, description = determine_outcome(top_pick, home_score, away_score)
-    logger.info(f"Outcome: {outcome} - {description}")
+        if home_score is None or away_score is None:
+            logger.warning(f"Scores not available for pick {pick.id}")
+            continue
 
-    # Store outcome with scores
-    await picks_repo.update_outcome_with_scores(top_pick, home_score, away_score, outcome)
-    logger.info(f"Stored outcome for pick {top_pick.id}")
+        # Determine outcome
+        outcome, description = determine_outcome(pick, home_score, away_score)
 
-    # Clean up other picks
-    deleted = await picks_repo.delete_picks_for_date_except(pick_date, top_pick.id)
-    logger.info(f"Cleaned up {deleted} non-top picks for {pick_date}")
+        # Store outcome with scores
+        await picks_repo.update_outcome_with_scores(pick, home_score, away_score, outcome)
+        resolved_count += 1
+        logger.info(f"Resolved pick {pick.id}: {pick.side} ({pick.bet_type}) -> {outcome}")
+
+    logger.info(f"Resolved {resolved_count} picks for {pick_date}")
+
+
+# Keep old function name as alias for backwards compatibility with backfill endpoint
+async def resolve_and_cleanup_picks(session, pick_date: date):
+    """Alias for resolve_all_picks (backwards compatibility)."""
+    await resolve_all_picks(session, pick_date)
 
 
 async def update_game_outcomes(session, game_date: date):

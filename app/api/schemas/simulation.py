@@ -11,36 +11,42 @@ class ChartDataPoint(BaseModel):
     bankroll: float
 
 
-class BetHistoryEntry(BaseModel):
-    """Single entry in bet history."""
-    date: str
+class BetDetail(BaseModel):
+    """Individual bet within a day."""
+    game: str
     pick: str
     betType: str
-    homeTeam: str
-    awayTeam: str
     odds: int
-    modelProb: float
-    impliedProb: float
-    edge: float
-    kellyBetSize: float
-    kellyBetDollars: float
+    modelProb: float  # As percentage (e.g., 62.5)
+    impliedProb: float  # As percentage (e.g., 52.4)
+    edge: float  # As percentage (e.g., 10.1)
+    kellyDollars: float  # Bet amount in dollars
+    outcome: str  # "win", "loss", or "push"
+    payout: float  # Net payout (positive for win, negative for loss)
+
+
+class DailySummary(BaseModel):
+    """Summary for a single day's betting."""
+    date: str
     portfolioBefore: float
     portfolioAfter: float
-    outcome: str
-    gameResult: str
+    netProfitLoss: float
+    record: str  # e.g., "3-2" or "3-2-1" if pushes
+    bets: List[BetDetail]
 
 
 class SimulationResponse(BaseModel):
     """Schema for the GET /simulation response."""
     chartData: List[ChartDataPoint]
-    betHistory: List[BetHistoryEntry]
+    dailySummaries: List[DailySummary]
     finalBankroll: float
-    wins: int
-    losses: int
-    pushes: int
+    totalWins: int
+    totalLosses: int
+    totalPushes: int
     winRate: float
     roi: float
     maxDrawdown: float
     peakBankroll: float
     daysSimulated: int
+    totalBets: int
     startingBankroll: float

@@ -325,13 +325,16 @@ class SimulationService:
         Run simulation from stored picks with cached outcomes.
 
         Uses outcomes and scores stored in the database - NO ESPN API calls.
-        Only includes picks that have been resolved (outcome is not None).
+        Processes ALL picks per day with cascade Kelly sizing:
+        - Highest edge pick gets Kelly % of current bankroll
+        - Next pick gets Kelly % of remaining available bankroll
+        - Continue until all picks processed
 
         Args:
             starting_bankroll: Starting portfolio value
 
         Returns:
-            Dictionary with chartData, betHistory, and summary stats
+            Dictionary with chartData, dailySummaries, and summary stats
         """
         # Get all picks with outcomes, ordered by date
         result = await self.session.execute(
@@ -344,48 +347,86 @@ class SimulationService:
         if not resolved_picks:
             return self._empty_live_simulation(starting_bankroll)
 
+        # Group picks by date
+        picks_by_date: Dict[date, List[DailyPick]] = {}
+        for pick in resolved_picks:
+            if pick.pick_date not in picks_by_date:
+                picks_by_date[pick.pick_date] = []
+            picks_by_date[pick.pick_date].append(pick)
+
         bankroll = starting_bankroll
         peak_bankroll = starting_bankroll
         max_drawdown_pct = 0.0
-        wins = 0
-        losses = 0
-        pushes = 0
+        total_wins = 0
+        total_losses = 0
+        total_pushes = 0
 
         # Start chart with initial bankroll
-        first_date = resolved_picks[0].pick_date
+        sorted_dates = sorted(picks_by_date.keys())
         chart_data = [{
             "day": 0,
-            "date": first_date.strftime("%b %d"),
+            "date": "Start",
             "bankroll": starting_bankroll,
         }]
-        bet_history = []
+        daily_summaries = []
         day_counter = 1
 
-        for pick in resolved_picks:
-            # Use stored outcome - NO ESPN CALL
-            outcome = pick.outcome
+        for pick_date in sorted_dates:
+            day_picks = picks_by_date[pick_date]
 
-            if outcome == "unknown":
-                continue
+            # Sort by edge descending (highest edge first for cascade Kelly)
+            day_picks.sort(key=lambda p: float(p.edge), reverse=True)
 
-            # Calculate bet size (Kelly) based on current bankroll
-            kelly_pct = float(pick.kelly_capped)
-            bet_size = kelly_pct * bankroll
+            day_before = bankroll
+            available_bankroll = bankroll  # Track what's available to bet
+            day_bets = []
+            day_wins = 0
+            day_losses = 0
+            day_pushes = 0
 
-            # Calculate payout
-            payout = calculate_payout_from_odds(bet_size, pick.odds, outcome)
+            for pick in day_picks:
+                outcome = pick.outcome
+                if outcome == "unknown":
+                    continue
 
-            # Track stats
-            portfolio_before = bankroll
-            bankroll += payout
-            portfolio_after = bankroll
+                # Calculate Kelly on available bankroll (cascade)
+                kelly_pct = min(float(pick.kelly_capped), 0.10)  # Cap at 10%
+                bet_amount = kelly_pct * available_bankroll
 
-            if outcome == "win":
-                wins += 1
-            elif outcome == "loss":
-                losses += 1
-            else:
-                pushes += 1
+                # Deduct from available (committed to this bet)
+                available_bankroll -= bet_amount
+
+                # Calculate payout
+                payout = calculate_payout_from_odds(bet_amount, pick.odds, outcome)
+
+                # Track day stats
+                if outcome == "win":
+                    day_wins += 1
+                    total_wins += 1
+                elif outcome == "loss":
+                    day_losses += 1
+                    total_losses += 1
+                else:
+                    day_pushes += 1
+                    total_pushes += 1
+
+                # Add bet detail
+                day_bets.append({
+                    "game": f"{pick.away_team} @ {pick.home_team}",
+                    "pick": pick.side,
+                    "betType": pick.bet_type,
+                    "odds": pick.odds,
+                    "modelProb": round(float(pick.model_prob) * 100, 1),
+                    "impliedProb": round(float(pick.implied_prob) * 100, 1),
+                    "edge": round(float(pick.edge), 1),
+                    "kellyDollars": round(bet_amount, 2),
+                    "outcome": outcome,
+                    "payout": round(payout, 2),
+                })
+
+            # End of day: apply all payouts
+            total_payout = sum(b["payout"] for b in day_bets)
+            bankroll = day_before + total_payout
 
             # Track peak and drawdown
             if bankroll > peak_bankroll:
@@ -394,52 +435,46 @@ class SimulationService:
             if drawdown > max_drawdown_pct:
                 max_drawdown_pct = drawdown
 
-            # Add to chart data
+            # Build record string
+            record = f"{day_wins}-{day_losses}"
+            if day_pushes > 0:
+                record += f"-{day_pushes}"
+
+            # Add daily summary
+            daily_summaries.append({
+                "date": pick_date.strftime("%b %d, %Y"),
+                "portfolioBefore": round(day_before, 2),
+                "portfolioAfter": round(bankroll, 2),
+                "netProfitLoss": round(total_payout, 2),
+                "record": record,
+                "bets": day_bets,
+            })
+
+            # Add to chart data (one point per day)
             chart_data.append({
                 "day": day_counter,
-                "date": pick.pick_date.strftime("%b %d"),
+                "date": pick_date.strftime("%b %d"),
                 "bankroll": round(bankroll, 2),
             })
             day_counter += 1
 
-            # Format game result description from stored scores
-            description = self._format_game_result(pick)
-
-            # Add to bet history
-            bet_history.append({
-                "date": pick.pick_date.strftime("%b %d, %Y"),
-                "pick": pick.side,
-                "betType": pick.bet_type,
-                "homeTeam": pick.home_team,
-                "awayTeam": pick.away_team,
-                "odds": pick.odds,
-                "modelProb": float(pick.model_prob),
-                "impliedProb": float(pick.implied_prob),
-                "edge": float(pick.edge),
-                "kellyBetSize": kelly_pct * 100,
-                "kellyBetDollars": round(bet_size, 2),
-                "portfolioBefore": round(portfolio_before, 2),
-                "portfolioAfter": round(portfolio_after, 2),
-                "outcome": outcome,
-                "gameResult": description,
-            })
-
-        total_bets = wins + losses + pushes
-        win_rate = (wins / total_bets * 100) if total_bets > 0 else 0
+        total_bets = total_wins + total_losses + total_pushes
+        win_rate = (total_wins / total_bets * 100) if total_bets > 0 else 0
         roi = ((bankroll - starting_bankroll) / starting_bankroll) * 100
 
         return {
             "chartData": chart_data,
-            "betHistory": bet_history,
+            "dailySummaries": daily_summaries,
             "finalBankroll": round(bankroll, 2),
-            "wins": wins,
-            "losses": losses,
-            "pushes": pushes,
+            "totalWins": total_wins,
+            "totalLosses": total_losses,
+            "totalPushes": total_pushes,
             "winRate": round(win_rate, 1),
             "roi": round(roi, 2),
             "maxDrawdown": round(max_drawdown_pct, 2),
             "peakBankroll": round(peak_bankroll, 2),
-            "daysSimulated": total_bets,
+            "daysSimulated": len(daily_summaries),
+            "totalBets": total_bets,
             "startingBankroll": starting_bankroll,
         }
 
@@ -467,17 +502,18 @@ class SimulationService:
         """Return empty simulation data for live simulation."""
         return {
             "chartData": [
-                {"day": 0, "date": date.today().strftime("%b %d"), "bankroll": starting_bankroll}
+                {"day": 0, "date": "Start", "bankroll": starting_bankroll}
             ],
-            "betHistory": [],
+            "dailySummaries": [],
             "finalBankroll": starting_bankroll,
-            "wins": 0,
-            "losses": 0,
-            "pushes": 0,
+            "totalWins": 0,
+            "totalLosses": 0,
+            "totalPushes": 0,
             "winRate": 0.0,
             "roi": 0.0,
             "maxDrawdown": 0.0,
             "peakBankroll": starting_bankroll,
             "daysSimulated": 0,
+            "totalBets": 0,
             "startingBankroll": starting_bankroll,
         }
