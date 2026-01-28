@@ -6,9 +6,13 @@ from app.config import settings
 engine = create_async_engine(
     settings.database_url_with_pgbouncer_fix,
     echo=settings.ENVIRONMENT == "development",
-    pool_pre_ping=True,
+    # Disable pool_pre_ping - it causes issues with pgbouncer
+    pool_pre_ping=False,
     # Disable statement caching for pgbouncer compatibility
-    connect_args={"statement_cache_size": 0},
+    connect_args={
+        "statement_cache_size": 0,
+        "prepared_statement_cache_size": 0,
+    },
 )
 
 async_session_factory = async_sessionmaker(
