@@ -4,7 +4,7 @@ from sqlalchemy.orm import declarative_base
 from app.config import settings
 
 engine = create_async_engine(
-    settings.DATABASE_URL,
+    settings.database_url_with_pgbouncer_fix,
     echo=settings.ENVIRONMENT == "development",
     pool_pre_ping=True,
     # Disable statement caching for pgbouncer compatibility
