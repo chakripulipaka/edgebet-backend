@@ -18,11 +18,13 @@ class PickResponse(BaseModel):
     edge: float
     player: Optional[str] = None
     gameStatus: str = "scheduled"  # scheduled, in_progress, halftime, final
+    outcome: Optional[str] = None  # win, loss, push, or None if game not final
 
 
 class PicksResponse(BaseModel):
     """Schema for the GET /picks response."""
     picks: List[PickResponse]
+    allGamesComplete: bool = False  # True when all games for the day are final
 
 
 class PicksQueryParams(BaseModel):

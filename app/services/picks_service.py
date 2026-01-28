@@ -558,6 +558,7 @@ class PicksService:
             "edge": float(pick.edge),
             "player": None,
             "gameStatus": game_status,
+            "outcome": pick.outcome if game_status == "final" else None,
         }
 
     def _get_game_statuses(self, pick_date: date) -> Dict[str, str]:
@@ -579,18 +580,20 @@ class PicksService:
     ) -> List[dict]:
         """
         Format picks with current game status.
-        Filters out picks for completed games.
+        Includes all picks regardless of game status (including final games).
         """
         formatted_picks = []
         for pick in picks:
             status = game_statuses.get(pick.espn_game_id, "scheduled")
-
-            # Skip picks for completed games
-            if status == "final":
-                continue
-
             formatted_picks.append(self._format_pick(pick, status))
 
         # Sort by edge descending
         formatted_picks.sort(key=lambda p: p.get("edge", 0), reverse=True)
         return formatted_picks
+
+    def check_all_games_complete(self, pick_date: date) -> bool:
+        """Check if all games for a date are final."""
+        game_statuses = self._get_game_statuses(pick_date)
+        if not game_statuses:
+            return False
+        return all(status == "final" for status in game_statuses.values())

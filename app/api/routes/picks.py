@@ -24,6 +24,7 @@ async def get_picks(
     Get today's top +EV betting picks.
 
     Returns picks sorted by edge, optionally filtered by bet type and minimum edge.
+    Includes allGamesComplete flag to indicate when all games for the day are final.
     """
     picks_service = PicksService(db)
 
@@ -39,6 +40,9 @@ async def get_picks(
     # Get picks
     picks = await picks_service.generate_picks_for_date(target_date)
 
+    # Check if all games are complete
+    all_games_complete = picks_service.check_all_games_complete(target_date)
+
     # Apply filters
     if bet_type:
         picks = [p for p in picks if p.get("betType", "").lower() == bet_type.lower()]
@@ -49,4 +53,4 @@ async def get_picks(
     # Convert to response format
     pick_responses = [PickResponse(**p) for p in picks]
 
-    return PicksResponse(picks=pick_responses)
+    return PicksResponse(picks=pick_responses, allGamesComplete=all_games_complete)
