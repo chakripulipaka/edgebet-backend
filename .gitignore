@@ -37,8 +37,7 @@ env/
 .env.local
 .env.production
 
-# Models (keep structure but ignore files)
-models/*.joblib
+# Models - tracked for deployment
 !models/.gitkeep
 
 # Database
