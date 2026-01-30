@@ -76,15 +76,13 @@ async def get_picks(
     start_date = now.date()
     end_date = end_time.date()
 
-    # Collect picks from all relevant dates
+    # Collect picks from ALL dates in the window (not just start/end)
     all_picks = []
-    dates_to_check = [start_date]
-    if end_date != start_date:
-        dates_to_check.append(end_date)
-
-    for current_date in dates_to_check:
+    current_date = start_date
+    while current_date <= end_date:
         date_picks = await picks_service.generate_picks_for_date(current_date)
         all_picks.extend(date_picks)
+        current_date += timedelta(days=1)
 
     # Filter to games within the time window AND not final
     # (Frontend will also filter, but we can reduce payload)
