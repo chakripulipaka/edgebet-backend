@@ -1,12 +1,13 @@
 """API routes for picks endpoints."""
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db
+from app.db.repositories.picks import PicksRepository
 from app.api.schemas.pick import PicksResponse, PickResponse
 from app.services.picks_service import PicksService
 
@@ -25,8 +26,6 @@ async def get_picks(
 
     Returns picks sorted by edge, optionally filtered by bet type and minimum edge.
     Includes allGamesComplete flag to indicate when all games for the day are final.
-
-    Auto-transitions to tomorrow's picks when today is complete (unless specific date requested).
     """
     picks_service = PicksService(db)
 
@@ -41,19 +40,9 @@ async def get_picks(
     else:
         target_date = date.today()
 
-    # Check if all games for target date are complete
+    # Get picks for target date
+    picks = await picks_service.generate_picks_for_date(target_date)
     all_games_complete = picks_service.check_all_games_complete(target_date)
-
-    # Auto-transition: If today is complete and no specific date was requested,
-    # automatically show tomorrow's picks
-    if all_games_complete and not specific_date_requested:
-        tomorrow = target_date + timedelta(days=1)
-        # Generate picks for tomorrow (will use cached if already generated)
-        picks = await picks_service.generate_picks_for_date(tomorrow)
-        # Tomorrow's games won't be complete yet
-        all_games_complete = picks_service.check_all_games_complete(tomorrow)
-    else:
-        picks = await picks_service.generate_picks_for_date(target_date)
 
     # Apply filters
     if bet_type:
@@ -66,3 +55,19 @@ async def get_picks(
     pick_responses = [PickResponse(**p) for p in picks]
 
     return PicksResponse(picks=pick_responses, allGamesComplete=all_games_complete)
+
+
+@router.delete("/picks/{pick_date}")
+async def delete_picks_for_date(
+    pick_date: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete all picks for a specific date."""
+    try:
+        target_date = datetime.strptime(pick_date, "%Y-%m-%d").date()
+    except ValueError:
+        return {"error": "Invalid date format. Use YYYY-MM-DD", "deleted": 0}
+
+    picks_repo = PicksRepository(db)
+    deleted_count = await picks_repo.delete_all_for_date(target_date)
+    return {"deleted": deleted_count, "date": pick_date}

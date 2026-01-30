@@ -4,6 +4,7 @@ import logging
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
+from time import time as get_time
 from typing import List, Optional, Dict, Tuple
 
 import numpy as np
@@ -22,6 +23,10 @@ from app.ml.models.spread import SpreadModel
 from app.ml.models.totals import TotalsModel
 
 logger = logging.getLogger(__name__)
+
+# In-memory cache for game statuses (avoids repeated ESPN API calls)
+_game_status_cache: Dict[str, Tuple[float, Dict[str, str]]] = {}
+_CACHE_TTL = 60  # seconds
 
 
 def get_team_name(team_id: int) -> str:
@@ -565,10 +570,24 @@ class PicksService:
         """
         Get current game statuses from ESPN for a date.
         Returns a dict mapping espn_game_id to status.
+        Uses in-memory cache to avoid repeated API calls.
         """
+        cache_key = str(pick_date)
+        now = get_time()
+
+        # Check cache first
+        if cache_key in _game_status_cache:
+            cached_time, cached_data = _game_status_cache[cache_key]
+            if now - cached_time < _CACHE_TTL:
+                logger.debug(f"Using cached game statuses for {pick_date}")
+                return cached_data
+
+        # Fetch fresh data from ESPN
         try:
             games = espn_data_service.get_games_for_date(pick_date)
-            return {g["nba_game_id"]: g.get("status", "scheduled") for g in games}
+            result = {g["nba_game_id"]: g.get("status", "scheduled") for g in games}
+            _game_status_cache[cache_key] = (now, result)
+            return result
         except Exception as e:
             logger.warning(f"Failed to fetch game statuses: {e}")
             return {}
