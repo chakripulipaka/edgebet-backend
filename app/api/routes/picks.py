@@ -2,9 +2,13 @@
 
 from datetime import date, datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
+
+# Use US Eastern timezone for "today" since NBA games are scheduled in ET
+EASTERN_TZ = ZoneInfo("America/New_York")
 
 from app.db.database import get_db
 from app.db.repositories.picks import PicksRepository
@@ -29,16 +33,16 @@ async def get_picks(
     """
     picks_service = PicksService(db)
 
-    # Parse date or use today
+    # Parse date or use today (in Eastern timezone since NBA uses ET)
     specific_date_requested = pick_date is not None
     if pick_date:
         try:
             target_date = datetime.strptime(pick_date, "%Y-%m-%d").date()
         except ValueError:
-            target_date = date.today()
+            target_date = datetime.now(EASTERN_TZ).date()
             specific_date_requested = False
     else:
-        target_date = date.today()
+        target_date = datetime.now(EASTERN_TZ).date()
 
     # Get picks for target date
     picks = await picks_service.generate_picks_for_date(target_date)
