@@ -1,11 +1,12 @@
 """Service for generating and managing daily picks."""
 
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from time import time as get_time
 from typing import List, Optional, Dict, Tuple
+from zoneinfo import ZoneInfo
 
 import numpy as np
 from scipy import stats
@@ -24,9 +25,13 @@ from app.ml.models.totals import TotalsModel
 
 logger = logging.getLogger(__name__)
 
-# In-memory cache for game statuses (avoids repeated ESPN API calls)
-_game_status_cache: Dict[str, Tuple[float, Dict[str, str]]] = {}
-_CACHE_TTL = 60  # seconds
+# NBA games are scheduled in Eastern timezone
+EASTERN_TZ = ZoneInfo("America/New_York")
+
+# In-memory cache to track dates we've already tried to generate picks for
+# This prevents re-fetching from APIs when no picks were generated
+_processed_dates_cache: Dict[date, float] = {}
+_PROCESSED_CACHE_TTL = 3600  # 1 hour - don't retry generating for an hour
 
 
 def get_team_name(team_id: int) -> str:
@@ -165,8 +170,18 @@ def build_features(home_rolling: Dict[str, float], away_rolling: Dict[str, float
     return features
 
 
+# Global cache for ML models - loaded once, reused forever
+_cached_models: Optional[Tuple[Optional[MoneylineModel], Optional[SpreadModel], Optional[TotalsModel]]] = None
+
+
 def load_models() -> Tuple[Optional[MoneylineModel], Optional[SpreadModel], Optional[TotalsModel]]:
-    """Load all trained models from disk."""
+    """Load all trained models from disk (cached after first load)."""
+    global _cached_models
+
+    # Return cached models if already loaded
+    if _cached_models is not None:
+        return _cached_models
+
     model_dir = Path(settings.MODEL_DIR)
 
     moneyline_model = None
@@ -197,7 +212,11 @@ def load_models() -> Tuple[Optional[MoneylineModel], Optional[SpreadModel], Opti
         except Exception as e:
             logger.error(f"Failed to load totals model: {e}")
 
-    return moneyline_model, spread_model, totals_model
+    # Cache for future calls
+    _cached_models = (moneyline_model, spread_model, totals_model)
+    logger.info("ML models cached for future requests")
+
+    return _cached_models
 
 
 def cover_prob_from_spread(predicted_spread: float, line: float, residual_std: float) -> Tuple[float, float]:
@@ -234,15 +253,24 @@ class PicksService:
 
         1. Check if picks already exist for this date in the database
         2. If yes, return cached picks (filtered by game status)
-        3. If no, fetch games from ESPN, generate predictions, save to DB
+        3. If no, check if we recently tried and got no picks (skip re-fetching)
+        4. Otherwise, fetch games from ESPN, generate predictions, save to DB
         """
-        # Check for existing picks first
+        # Check for existing picks first - return cached picks instantly
         existing_picks = await self.picks_repo.get_all_by_date(pick_date)
         if existing_picks:
             logger.info(f"Found {len(existing_picks)} cached picks for {pick_date}")
-            # Get current game statuses from ESPN
-            game_statuses = self._get_game_statuses(pick_date)
-            return self._format_picks_with_status(existing_picks, game_statuses)
+            # Use time-based status calculation (no API calls)
+            return self._format_picks_with_status(existing_picks)
+
+        # Check if we recently tried to generate picks for this date and got none
+        # This prevents repeated API calls when odds don't match games
+        now = get_time()
+        if pick_date in _processed_dates_cache:
+            last_processed = _processed_dates_cache[pick_date]
+            if now - last_processed < _PROCESSED_CACHE_TTL:
+                logger.info(f"Skipping {pick_date} - recently processed with no picks")
+                return []
 
         # Determine season
         if pick_date.month >= 10:
@@ -289,6 +317,11 @@ class PicksService:
             )
             all_picks.extend(game_picks)
 
+        # Mark this date as processed (even if no picks generated)
+        # This prevents repeated API calls when odds don't match games
+        _processed_dates_cache[pick_date] = get_time()
+        logger.info(f"Processed {pick_date}: generated {len(all_picks)} picks")
+
         # Sort by edge descending
         all_picks.sort(key=lambda p: p.get("edge", 0), reverse=True)
 
@@ -333,7 +366,13 @@ class PicksService:
         # Match game to odds
         game_odds = odds_service.match_game_to_odds(home_abbr, away_abbr, odds_data)
         if not game_odds:
-            game_odds = self._default_odds()
+            logger.warning(f"SKIPPING {away_abbr} @ {home_abbr}: No matching odds found in Odds API")
+            return []
+
+        # Validate odds aren't suspicious defaults
+        if not self._validate_odds(game_odds, home_abbr, away_abbr):
+            logger.warning(f"SKIPPING {away_abbr} @ {home_abbr}: Odds appear to be defaults")
+            return []
 
         picks = []
 
@@ -535,12 +574,65 @@ class PicksService:
         return self._format_pick(db_pick)
 
     def _default_odds(self) -> dict:
-        """Return default odds structure."""
+        """Return default odds structure. DEPRECATED - should not be used."""
+        logger.error("_default_odds() called - this should not happen!")
         return {
             "moneyline": {"home_odds": -110, "away_odds": -110},
             "spread": {"line": 0, "home_odds": -110, "away_odds": -110},
             "total": {"line": 220, "over_odds": -110, "under_odds": -110},
         }
+
+    def _validate_odds(self, game_odds: dict, home_abbr: str, away_abbr: str) -> bool:
+        """
+        Validate that odds are real and not suspicious default values.
+
+        Returns True if odds appear legitimate, False otherwise.
+        """
+        # Must have all three markets with actual data
+        if not game_odds:
+            logger.warning(f"No odds data for {away_abbr} @ {home_abbr}")
+            return False
+
+        moneyline = game_odds.get("moneyline")
+        spread = game_odds.get("spread")
+        total = game_odds.get("total")
+
+        if not moneyline or not spread or not total:
+            logger.warning(
+                f"Missing markets for {away_abbr} @ {home_abbr}: "
+                f"ml={bool(moneyline)}, spread={bool(spread)}, total={bool(total)}"
+            )
+            return False
+
+        spread_line = spread.get("line", 0)
+        total_line = total.get("line", 0)
+
+        # Reject if total is exactly 220 (very likely a default)
+        if total_line == 220:
+            logger.warning(
+                f"Default total (220) for {away_abbr} @ {home_abbr} - skipping"
+            )
+            return False
+
+        # Reject if spread is exactly 0 AND total is a round number (likely defaults)
+        if spread_line == 0:
+            logger.warning(
+                f"Default spread (0.0) for {away_abbr} @ {home_abbr} - skipping"
+            )
+            return False
+
+        # Sanity check total line (NBA games typically 200-270 range)
+        if total_line < 180 or total_line > 280:
+            logger.warning(
+                f"Suspicious total for {away_abbr} @ {home_abbr}: {total_line} (outside normal range)"
+            )
+            return False
+
+        logger.info(
+            f"Valid odds for {away_abbr} @ {home_abbr}: "
+            f"spread={spread_line}, total={total_line}"
+        )
+        return True
 
     def _format_pick(self, pick: DailyPick, game_status: str = "scheduled") -> dict:
         """Format a DailyPick database model to API response format."""
@@ -564,55 +656,86 @@ class PicksService:
             "player": None,
             "gameStatus": game_status,
             "outcome": pick.outcome if game_status == "final" else None,
+            "espnGameId": pick.espn_game_id,  # Include for tracking in hourly job
         }
 
-    def _get_game_statuses(self, pick_date: date) -> Dict[str, str]:
+    def _calculate_game_status(self, game_time: Optional[datetime]) -> str:
         """
-        Get current game statuses from ESPN for a date.
-        Returns a dict mapping espn_game_id to status.
-        Uses in-memory cache to avoid repeated API calls.
+        Calculate game status from game_time (timezone-aware).
+
+        - game_time > now: "scheduled"
+        - game_time <= now < game_time + 3 hours: "in_progress"
+        - game_time + 3 hours <= now: "final"
         """
-        cache_key = str(pick_date)
-        now = get_time()
+        if not game_time:
+            return "scheduled"
 
-        # Check cache first
-        if cache_key in _game_status_cache:
-            cached_time, cached_data = _game_status_cache[cache_key]
-            if now - cached_time < _CACHE_TTL:
-                logger.debug(f"Using cached game statuses for {pick_date}")
-                return cached_data
+        # Always compare in Eastern timezone (NBA schedule timezone)
+        now = datetime.now(EASTERN_TZ)
 
-        # Fetch fresh data from ESPN
-        try:
-            games = espn_data_service.get_games_for_date(pick_date)
-            result = {g["nba_game_id"]: g.get("status", "scheduled") for g in games}
-            _game_status_cache[cache_key] = (now, result)
-            return result
-        except Exception as e:
-            logger.warning(f"Failed to fetch game statuses: {e}")
-            return {}
+        # Convert game_time to Eastern if it has timezone info
+        if game_time.tzinfo:
+            game_time_et = game_time.astimezone(EASTERN_TZ)
+        else:
+            # Assume stored as Eastern if naive
+            game_time_et = game_time.replace(tzinfo=EASTERN_TZ)
 
-    def _format_picks_with_status(
-        self,
-        picks: List[DailyPick],
-        game_statuses: Dict[str, str]
-    ) -> List[dict]:
+        game_end_estimate = game_time_et + timedelta(hours=3)
+
+        if now < game_time_et:
+            return "scheduled"
+        elif now < game_end_estimate:
+            return "in_progress"
+        else:
+            return "final"
+
+    def _format_picks_with_status(self, picks: List[DailyPick]) -> List[dict]:
         """
-        Format picks with current game status.
-        Includes all picks regardless of game status (including final games).
+        Format picks with game status calculated from game_time.
+        No API calls - uses time-based status calculation.
         """
         formatted_picks = []
         for pick in picks:
-            status = game_statuses.get(pick.espn_game_id, "scheduled")
+            status = self._calculate_game_status(pick.game_time)
             formatted_picks.append(self._format_pick(pick, status))
 
         # Sort by edge descending
         formatted_picks.sort(key=lambda p: p.get("edge", 0), reverse=True)
         return formatted_picks
 
-    def check_all_games_complete(self, pick_date: date) -> bool:
-        """Check if all games for a date are final."""
-        game_statuses = self._get_game_statuses(pick_date)
-        if not game_statuses:
+    def check_all_games_complete(self, picks: List[DailyPick]) -> bool:
+        """Check if all picks have games that are final (based on game_time)."""
+        if not picks:
             return False
-        return all(status == "final" for status in game_statuses.values())
+        return all(
+            self._calculate_game_status(pick.game_time) == "final"
+            for pick in picks
+        )
+
+    async def check_and_resolve_completed_day(self, pick_date: date) -> bool:
+        """
+        Check if all games for a date are final. If so, resolve outcomes via ESPN.
+        Returns True if day was completed and resolved.
+
+        This is called once per page load to auto-transfer completed days to simulation.
+        """
+        picks = await self.picks_repo.get_all_by_date(pick_date)
+        if not picks:
+            return False
+
+        # Check if all games are final (time-based)
+        all_final = self.check_all_games_complete(picks)
+        if not all_final:
+            return False
+
+        # Check if outcomes already resolved
+        unresolved = [p for p in picks if p.outcome is None]
+        if not unresolved:
+            logger.debug(f"All picks for {pick_date} already resolved")
+            return True  # Already resolved
+
+        # Resolve outcomes via ESPN (one API call per game)
+        logger.info(f"Auto-resolving {len(unresolved)} picks for {pick_date}")
+        from app.jobs.daily_job import resolve_all_picks
+        await resolve_all_picks(self.session, pick_date)
+        return True

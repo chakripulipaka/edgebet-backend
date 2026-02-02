@@ -5,14 +5,16 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # Use US Eastern timezone for "today" since NBA games are scheduled in ET
 EASTERN_TZ = ZoneInfo("America/New_York")
 
 from app.db.database import get_db
+from app.db.models import PicksSnapshot
 from app.db.repositories.picks import PicksRepository
-from app.api.schemas.pick import PicksResponse, PickResponse
+from app.api.schemas.pick import PicksResponse, PickResponse, GameWithoutPicks
 from app.services.picks_service import PicksService
 
 router = APIRouter()
@@ -44,31 +46,68 @@ async def get_picks(
     """
     Get upcoming +EV betting picks for the next N hours.
 
-    By default, returns picks for games in the next 36 hours.
+    Returns pre-computed picks from hourly snapshot for instant loading.
+    Falls back to live computation if no snapshot exists yet.
+
     If pick_date is specified, returns picks for that specific date only.
-
-    Returns picks sorted by game time, with live games indicated by gameStatus.
     """
-    picks_service = PicksService(db)
-
-    # If specific date requested, use old behavior
+    # If specific date requested, use live computation
     if pick_date:
         try:
             target_date = datetime.strptime(pick_date, "%Y-%m-%d").date()
+            picks_service = PicksService(db)
             picks = await picks_service.generate_picks_for_date(target_date)
-            all_games_complete = picks_service.check_all_games_complete(target_date)
 
             if bet_type:
                 picks = [p for p in picks if p.get("betType", "").lower() == bet_type.lower()]
             if min_edge is not None:
                 picks = [p for p in picks if p.get("edge", 0) >= min_edge]
 
+            # Check if all games are complete based on gameStatus in formatted picks
+            all_games_complete = (
+                len(picks) > 0 and
+                all(p.get("gameStatus") == "final" for p in picks)
+            )
+
             pick_responses = [PickResponse(**p) for p in picks]
             return PicksResponse(picks=pick_responses, allGamesComplete=all_games_complete)
         except ValueError:
-            pass  # Fall through to rolling window behavior
+            pass  # Fall through to snapshot behavior
 
-    # Rolling window: get picks for games in the next N hours
+    # Try to get the latest snapshot (fast path - instant response)
+    result = await db.execute(
+        select(PicksSnapshot)
+        .order_by(PicksSnapshot.computed_at.desc())
+        .limit(1)
+    )
+    snapshot = result.scalar_one_or_none()
+
+    if snapshot:
+        # Return pre-computed data from snapshot
+        snapshot_data = snapshot.snapshot_data
+        picks_data = snapshot_data.get("picks", [])
+        games_without_picks = snapshot_data.get("gamesWithoutPicks", [])
+
+        # Apply optional filters
+        if bet_type:
+            picks_data = [p for p in picks_data if p.get("betType", "").lower() == bet_type.lower()]
+        if min_edge is not None:
+            picks_data = [p for p in picks_data if p.get("edge", 0) >= min_edge]
+
+        pick_responses = [PickResponse(**p) for p in picks_data]
+        games_without_responses = [GameWithoutPicks(**g) for g in games_without_picks]
+
+        return PicksResponse(
+            picks=pick_responses,
+            gamesWithoutPicks=games_without_responses,
+            allGamesComplete=snapshot_data.get("allGamesComplete", False),
+            computedAt=snapshot_data.get("computedAt"),
+        )
+
+    # No snapshot yet - fall back to live computation
+    # This only happens on first load before any hourly job has run
+    picks_service = PicksService(db)
+
     now = datetime.now(EASTERN_TZ)
     end_time = now + timedelta(hours=hours)
 
@@ -85,7 +124,6 @@ async def get_picks(
         current_date += timedelta(days=1)
 
     # Filter to games within the time window AND not final
-    # (Frontend will also filter, but we can reduce payload)
     filtered_picks = []
     for pick in all_picks:
         game_time = parse_game_time(pick.get("gameTime", ""))
@@ -112,7 +150,6 @@ async def get_picks(
         status = pick.get("gameStatus", "scheduled")
         is_live = status in ("in_progress", "halftime")
         game_time = parse_game_time(pick.get("gameTime", ""))
-        # Live games get priority (0), scheduled get (1), so live comes first
         return (0 if is_live else 1, game_time)
 
     filtered_picks.sort(key=sort_key)
@@ -120,7 +157,7 @@ async def get_picks(
     # Convert to response format
     pick_responses = [PickResponse(**p) for p in filtered_picks]
 
-    # All games complete only if no picks remain (all were final or none scheduled)
+    # All games complete only if no picks remain
     all_games_complete = len(pick_responses) == 0
 
     return PicksResponse(picks=pick_responses, allGamesComplete=all_games_complete)

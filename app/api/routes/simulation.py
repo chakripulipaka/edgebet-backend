@@ -2,14 +2,16 @@
 
 from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db
+from app.db.models import SimulationSnapshot
 from app.db.repositories.picks import PicksRepository
 from app.api.schemas.simulation import SimulationResponse
 from app.services.simulation_service import SimulationService
 from app.services.picks_service import PicksService
-from app.jobs.daily_job import resolve_and_cleanup_picks, resolve_all_picks, run_daily_job
+from app.jobs.daily_job import resolve_and_cleanup_picks, resolve_all_picks, run_daily_job, run_hourly_picks_job
 
 router = APIRouter()
 
@@ -20,20 +22,71 @@ async def get_simulation(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Get simulation data based on stored picks.
+    Get pre-computed simulation data from the latest snapshot.
 
-    Runs simulation dynamically by:
-    1. Getting all stored picks from the database
-    2. For each day with picks, selecting the highest-edge pick
-    3. Fetching game results from ESPN
-    4. Calculating outcomes and updating bankroll with Kelly sizing
+    Snapshots are computed daily at 9 AM EST.
+    If no snapshot exists yet, falls back to live calculation.
 
     Returns bankroll progression, win/loss record, and bet history.
     """
+    # Try to get the latest snapshot (fast path)
+    result = await db.execute(
+        select(SimulationSnapshot)
+        .order_by(SimulationSnapshot.computed_at.desc())
+        .limit(1)
+    )
+    snapshot = result.scalar_one_or_none()
+
+    if snapshot:
+        # Return pre-computed data (instant)
+        return SimulationResponse(**snapshot.snapshot_data)
+
+    # No snapshot yet - fall back to live calculation
+    # This only happens on first load before any daily job has run
     sim_service = SimulationService(db)
     data = await sim_service.run_live_simulation(starting_bankroll)
 
     return SimulationResponse(**data)
+
+
+@router.post("/simulation/resolve-pending")
+async def resolve_pending_picks(db: AsyncSession = Depends(get_db)):
+    """
+    Resolve outcomes for picks where games have completed.
+
+    Called by frontend auto-polling to check for newly completed games.
+    Only resolves picks where games are now final but outcome is not yet stored.
+    """
+    picks_repo = PicksRepository(db)
+    pending_picks = await picks_repo.get_pending_picks()
+
+    if not pending_picks:
+        return {"message": "No pending picks", "resolved": 0, "pending": 0}
+
+    # Get unique dates (only check recent dates to avoid unnecessary API calls)
+    dates = sorted(set(p.pick_date for p in pending_picks))
+    resolved_count = 0
+    still_pending = 0
+
+    for pick_date in dates:
+        # Only process dates within the last 7 days
+        if (datetime.now().date() - pick_date).days > 7:
+            continue
+
+        await resolve_all_picks(db, pick_date)
+
+        # Check how many were resolved vs still pending
+        remaining = await picks_repo.get_pending_picks_for_date(pick_date)
+        if not remaining:
+            resolved_count += 1
+        else:
+            still_pending += len(remaining)
+
+    return {
+        "message": f"Processed {len(dates)} date(s)",
+        "dates_resolved": resolved_count,
+        "picks_still_pending": still_pending,
+    }
 
 
 @router.post("/simulation/backfill")
@@ -59,6 +112,34 @@ async def backfill_simulation(db: AsyncSession = Depends(get_db)):
     return {"message": f"Backfilled {resolved_count} dates", "resolved": resolved_count}
 
 
+@router.delete("/simulation/clear-all")
+async def clear_all_picks(db: AsyncSession = Depends(get_db)):
+    """
+    Delete ALL picks and simulation data to start fresh.
+
+    Use this when you need to reset and start tracking from scratch
+    (e.g., after fixing data quality issues).
+    """
+    from sqlalchemy import delete
+    from app.db.models import DailyPick, SimulationState
+
+    # Delete all picks
+    result = await db.execute(delete(DailyPick))
+    picks_deleted = result.rowcount
+
+    # Delete all simulation states
+    result = await db.execute(delete(SimulationState))
+    states_deleted = result.rowcount
+
+    await db.commit()
+
+    return {
+        "message": "All data cleared",
+        "picks_deleted": picks_deleted,
+        "simulation_states_deleted": states_deleted,
+    }
+
+
 @router.post("/jobs/daily")
 async def trigger_daily_job():
     """
@@ -69,6 +150,23 @@ async def trigger_daily_job():
     """
     await run_daily_job()
     return {"message": "Daily job completed successfully"}
+
+
+@router.post("/jobs/hourly-picks")
+async def trigger_hourly_picks_job():
+    """
+    Trigger the hourly picks job on-demand.
+
+    Used by external schedulers (e.g., Render Cron Jobs) to pre-compute
+    picks snapshot for instant dashboard loading.
+
+    This job:
+    - Fetches fresh odds for scheduled games
+    - Keeps locked odds for live/final games
+    - Creates a snapshot for instant frontend retrieval
+    """
+    await run_hourly_picks_job()
+    return {"message": "Hourly picks job completed successfully"}
 
 
 @router.post("/simulation/regenerate")

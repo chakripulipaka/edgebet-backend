@@ -53,6 +53,15 @@ class PicksRepository:
         )
         return list(result.scalars().all())
 
+    async def get_pending_picks_for_date(self, pick_date: date) -> List[DailyPick]:
+        """Get all picks for a specific date that don't have an outcome yet."""
+        result = await self.session.execute(
+            select(DailyPick)
+            .where(DailyPick.pick_date == pick_date, DailyPick.outcome.is_(None))
+            .order_by(DailyPick.edge.desc())
+        )
+        return list(result.scalars().all())
+
     async def create_pick(
         self,
         pick_date: date,
@@ -169,3 +178,23 @@ class PicksRepository:
             await self.session.delete(pick)
         await self.session.commit()
         return count
+
+    async def delete_by_ids(self, pick_ids: List[int]) -> int:
+        """
+        Delete picks by their IDs.
+
+        Returns the number of picks deleted.
+        """
+        if not pick_ids:
+            return 0
+
+        result = await self.session.execute(
+            select(DailyPick).where(DailyPick.id.in_(pick_ids))
+        )
+        picks = list(result.scalars().all())
+
+        for pick in picks:
+            await self.session.delete(pick)
+
+        await self.session.commit()
+        return len(picks)

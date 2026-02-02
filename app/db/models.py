@@ -1,6 +1,6 @@
 from sqlalchemy import (
     Column, Integer, String, Date, DateTime, Boolean,
-    ForeignKey, Numeric, UniqueConstraint
+    ForeignKey, Numeric, UniqueConstraint, JSON
 )
 from sqlalchemy.orm import relationship
 
@@ -108,3 +108,29 @@ class SimulationState(Base):
     pick_id = Column(Integer, ForeignKey("daily_picks.id"), nullable=True)
 
     pick = relationship("DailyPick", back_populates="simulation_states")
+
+
+class SimulationSnapshot(Base):
+    """Pre-computed simulation data snapshot, updated daily at 9 AM."""
+    __tablename__ = "simulation_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    computed_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    through_date = Column(Date, nullable=False)  # Data includes picks up to this date
+
+    # Store the full SimulationResponse as JSON for fast retrieval
+    # Contains: chartData, dailySummaries, finalBankroll, totalWins, totalLosses,
+    # totalPushes, totalBets, winRate, roi, maxDrawdown, daysSimulated
+    snapshot_data = Column(JSON, nullable=False)
+
+
+class PicksSnapshot(Base):
+    """Pre-computed picks data snapshot, updated hourly for instant dashboard loading."""
+    __tablename__ = "picks_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    computed_at = Column(DateTime(timezone=True), nullable=False, index=True)
+
+    # Store the full PicksResponse as JSON for fast retrieval
+    # Contains: picks (array), gamesWithoutPicks (array), allGamesComplete (bool)
+    snapshot_data = Column(JSON, nullable=False)

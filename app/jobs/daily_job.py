@@ -2,6 +2,7 @@
 
 import logging
 from datetime import date, datetime, timedelta
+from typing import List, Dict, Any
 import pytz
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -13,6 +14,7 @@ from app.db.repositories.picks import PicksRepository
 from app.services.picks_service import PicksService
 from app.services.simulation_service import SimulationService
 from app.services.espn_data import espn_data_service
+from app.services.odds_data import odds_service, clear_odds_cache
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -31,6 +33,7 @@ async def run_daily_job():
     Steps:
     1. Resolve ALL of yesterday's picks and store outcomes with scores
     2. Generate today's picks
+    3. Compute and store simulation snapshot
     """
     logger.info("Starting daily job...")
 
@@ -45,18 +48,238 @@ async def run_daily_job():
             logger.info(f"Processing picks for {yesterday}")
             await resolve_all_picks(session, yesterday)
 
-            # Step 3: Generate today's picks (if not already generated)
+            # Step 2: Generate today's picks (if not already generated)
             existing_picks = await picks_repo.get_all_by_date(today)
             if not existing_picks:
                 logger.info(f"Generating picks for {today}")
                 picks_service = PicksService(session)
                 await picks_service.generate_picks_for_date(today)
 
+            # Step 3: Compute and store simulation snapshot
+            logger.info("Computing simulation snapshot...")
+            await compute_and_store_snapshot(session, yesterday)
+
             logger.info("Daily job completed successfully")
 
         except Exception as e:
             logger.error(f"Daily job failed: {e}", exc_info=True)
             raise
+
+
+async def run_hourly_picks_job():
+    """
+    Hourly job to pre-compute picks for instant dashboard loading.
+    Runs at :00 of each hour EST.
+
+    - Fetches fresh odds for scheduled games only
+    - Updates picks for games that haven't started
+    - Creates snapshot for instant frontend loading
+
+    Games that have started keep their locked odds (no update).
+    """
+    logger.info("Starting hourly picks job...")
+
+    async with async_session_factory() as session:
+        try:
+            from app.services.picks_service import get_team_name
+            from app.db.models import PicksSnapshot
+
+            now = datetime.now(EST)
+            picks_service = PicksService(session)
+            picks_repo = PicksRepository(session)
+
+            # Clear caches to get fresh data
+            clear_odds_cache()
+
+            # Clear the processed dates cache so we regenerate picks
+            from app.services.picks_service import _processed_dates_cache
+            _processed_dates_cache.clear()
+            logger.info("Cleared odds and processed dates caches")
+
+            # Collect all picks and track which games have picks (across all dates)
+            all_picks: List[Dict[str, Any]] = []
+            all_games_with_picks: set = set()  # Track ESPN game IDs that have picks
+            all_espn_games: List[Dict[str, Any]] = []  # All games from ESPN
+
+            # Process each date in the window (today, tomorrow, day after)
+            for days_ahead in [0, 1, 2]:
+                target_date = (now + timedelta(days=days_ahead)).date()
+                logger.info(f"Processing {target_date} (days ahead: {days_ahead})")
+
+                # Get existing picks for this date
+                existing_picks = await picks_repo.get_all_by_date(target_date)
+
+                # Separate live/final picks from scheduled picks
+                live_final_picks = []
+                scheduled_pick_ids = []
+
+                for pick in existing_picks:
+                    status = picks_service._calculate_game_status(pick.game_time)
+                    if status == "scheduled":
+                        # Will regenerate with fresh odds
+                        scheduled_pick_ids.append(pick.id)
+                    else:
+                        # Keep locked odds for live/final games
+                        formatted = picks_service._format_pick(pick, status)
+                        live_final_picks.append(formatted)
+                        all_games_with_picks.add(pick.espn_game_id)
+
+                # Delete scheduled picks (they'll be regenerated with fresh odds)
+                if scheduled_pick_ids:
+                    await picks_repo.delete_by_ids(scheduled_pick_ids)
+                    logger.info(f"Deleted {len(scheduled_pick_ids)} scheduled picks for {target_date}")
+
+                # Add live/final picks to our collection
+                all_picks.extend(live_final_picks)
+
+                # Generate fresh picks for scheduled games (fetches fresh odds)
+                new_picks = await picks_service.generate_picks_for_date(target_date)
+
+                # Add only scheduled picks (live/final already added above)
+                for pick in new_picks:
+                    if pick.get("gameStatus") == "scheduled":
+                        all_picks.append(pick)
+                        if pick.get("espnGameId"):
+                            all_games_with_picks.add(pick.get("espnGameId"))
+
+                # Get all games from ESPN for this date
+                games_on_date = espn_data_service.get_games_for_date(target_date)
+                for game in games_on_date:
+                    all_espn_games.append({
+                        "game_id": game.get("nba_game_id"),
+                        "home_team_id": game.get("home_team_id"),
+                        "away_team_id": game.get("away_team_id"),
+                        "game_time": game.get("game_time"),
+                        "date": target_date,
+                    })
+
+            # Find games without picks (scheduled games with no odds available)
+            games_without_picks = []
+            for game in all_espn_games:
+                game_id = game.get("game_id")
+                game_time = game.get("game_time")
+
+                # Skip if we have picks for this game
+                if game_id in all_games_with_picks:
+                    continue
+
+                # Calculate game status
+                if game_time:
+                    status = picks_service._calculate_game_status(game_time)
+                else:
+                    status = "scheduled"
+
+                # Only include scheduled games (live/final without picks are edge cases)
+                if status == "scheduled":
+                    games_without_picks.append({
+                        "homeTeam": get_team_name(game.get("home_team_id")),
+                        "awayTeam": get_team_name(game.get("away_team_id")),
+                        "gameTime": game_time.isoformat() if game_time else f"{game.get('date')}T19:00:00",
+                        "gameStatus": "scheduled",
+                        "espnGameId": game_id,
+                    })
+
+            # Filter to 36-hour window
+            cutoff_time = now + timedelta(hours=36)
+
+            def parse_time(time_str):
+                try:
+                    dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
+                    if dt.tzinfo:
+                        return dt.astimezone(EST)
+                    return dt.replace(tzinfo=EST.localize(datetime.now()).tzinfo)
+                except Exception:
+                    return now + timedelta(days=365)
+
+            # Filter picks to 36-hour window (keep live games always)
+            filtered_picks = []
+            for pick in all_picks:
+                game_time = parse_time(pick.get("gameTime", ""))
+                game_status = pick.get("gameStatus", "scheduled")
+
+                if game_status in ("in_progress", "halftime"):
+                    # Always show live games
+                    filtered_picks.append(pick)
+                elif game_status == "scheduled" and game_time <= cutoff_time:
+                    # Scheduled games within window
+                    filtered_picks.append(pick)
+                # Skip final games (they disappear from dashboard)
+
+            # Filter games without picks to 36-hour window
+            filtered_games_without = [
+                g for g in games_without_picks
+                if parse_time(g.get("gameTime", "")) <= cutoff_time
+            ]
+
+            # Sort picks: live first, then by game time
+            def sort_key(pick):
+                status = pick.get("gameStatus", "scheduled")
+                is_live = status in ("in_progress", "halftime")
+                game_time = parse_time(pick.get("gameTime", ""))
+                return (0 if is_live else 1, game_time)
+
+            filtered_picks.sort(key=sort_key)
+            filtered_games_without.sort(key=lambda g: parse_time(g.get("gameTime", "")))
+
+            # Check if all games are complete (nothing to show)
+            all_complete = len(filtered_picks) == 0 and len(filtered_games_without) == 0
+
+            # Create snapshot
+            snapshot_data = {
+                "picks": filtered_picks,
+                "gamesWithoutPicks": filtered_games_without,
+                "allGamesComplete": all_complete,
+                "computedAt": now.isoformat(),
+            }
+
+            snapshot = PicksSnapshot(
+                computed_at=now,
+                snapshot_data=snapshot_data,
+            )
+
+            session.add(snapshot)
+            await session.commit()
+
+            logger.info(
+                f"Hourly picks job complete: {len(filtered_picks)} picks, "
+                f"{len(filtered_games_without)} games without picks"
+            )
+
+        except Exception as e:
+            logger.error(f"Hourly picks job failed: {e}", exc_info=True)
+            raise
+
+
+async def compute_and_store_snapshot(session, through_date: date):
+    """
+    Compute full simulation and store as a snapshot for fast retrieval.
+
+    Args:
+        session: Database session
+        through_date: The last date included in the simulation data
+    """
+    from app.db.models import SimulationSnapshot
+
+    sim_service = SimulationService(session)
+
+    # Run the full simulation calculation
+    result = await sim_service.run_live_simulation(starting_bankroll=100.0)
+
+    # Create snapshot with the full response data
+    snapshot = SimulationSnapshot(
+        computed_at=datetime.now(EST),
+        through_date=through_date,
+        snapshot_data=result
+    )
+
+    session.add(snapshot)
+    await session.commit()
+
+    logger.info(
+        f"Stored simulation snapshot: through_date={through_date}, "
+        f"final_bankroll=${result.get('finalBankroll', 0):.2f}, "
+        f"days_simulated={result.get('daysSimulated', 0)}"
+    )
 
 
 async def resolve_all_picks(session, pick_date: date):
@@ -222,5 +445,14 @@ if settings.ENVIRONMENT == "production":
         sync_today_games,
         CronTrigger(hour=6, minute=0, timezone=EST),
         id="sync_games",
+        replace_existing=True,
+    )
+
+    # Hourly picks refresh at :00 of each hour
+    # Pre-computes picks for instant dashboard loading
+    scheduler.add_job(
+        run_hourly_picks_job,
+        CronTrigger(minute=0, timezone=EST),  # Every hour at :00
+        id="hourly_picks_job",
         replace_existing=True,
     )
