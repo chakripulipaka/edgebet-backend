@@ -26,12 +26,76 @@ EST = pytz.timezone("America/New_York")
 scheduler = AsyncIOScheduler()
 
 
+async def resolve_all_pending_picks() -> int:
+    """
+    Resolve ALL unresolved picks across all past dates.
+
+    This is the safety net that ensures no picks are ever lost,
+    regardless of how many days the server was asleep or how many
+    cron jobs were missed.
+
+    Returns the total number of picks resolved.
+    """
+    logger.info("Starting resolve_all_pending_picks...")
+
+    async with async_session_factory() as session:
+        try:
+            picks_repo = PicksRepository(session)
+            pending = await picks_repo.get_pending_picks()
+
+            if not pending:
+                logger.info("No pending picks to resolve")
+                return 0
+
+            today = date.today()
+            past_dates = sorted(set(
+                p.pick_date for p in pending
+                if p.pick_date < today  # Skip today (games may still be live)
+            ))
+
+            if not past_dates:
+                logger.info("All pending picks are for today or future - skipping")
+                return 0
+
+            logger.info(
+                f"Found {len(pending)} unresolved picks across "
+                f"{len(past_dates)} past date(s): {past_dates}"
+            )
+
+            total_resolved = 0
+            for pick_date in past_dates:
+                before = await picks_repo.get_pending_picks_for_date(pick_date)
+                await resolve_all_picks(session, pick_date)
+                after = await picks_repo.get_pending_picks_for_date(pick_date)
+                resolved = len(before) - len(after)
+                total_resolved += resolved
+
+                if after:
+                    logger.warning(
+                        f"{len(after)} picks still pending for {pick_date} "
+                        f"(games may not be final on ESPN yet)"
+                    )
+
+            # Recompute simulation snapshot if any picks were resolved
+            if total_resolved > 0:
+                yesterday = today - timedelta(days=1)
+                logger.info(f"Recomputing simulation snapshot ({total_resolved} picks resolved)...")
+                await compute_and_store_snapshot(session, yesterday)
+
+            logger.info(f"resolve_all_pending_picks complete: resolved {total_resolved} picks")
+            return total_resolved
+
+        except Exception as e:
+            logger.error(f"resolve_all_pending_picks failed: {e}", exc_info=True)
+            raise
+
+
 async def run_daily_job():
     """
     Main daily job that runs at 9 AM EST.
 
     Steps:
-    1. Resolve ALL of yesterday's picks and store outcomes with scores
+    1. Resolve ALL pending picks (not just yesterday - catches up on missed days)
     2. Generate today's picks
     3. Compute and store simulation snapshot
     """
@@ -44,9 +108,20 @@ async def run_daily_job():
 
             picks_repo = PicksRepository(session)
 
-            # Step 1: Resolve ALL of yesterday's picks
-            logger.info(f"Processing picks for {yesterday}")
-            await resolve_all_picks(session, yesterday)
+            # Step 1: Resolve ALL pending picks from past dates
+            # This catches up on any missed days, not just yesterday
+            pending = await picks_repo.get_pending_picks()
+            past_dates = sorted(set(
+                p.pick_date for p in pending
+                if p.pick_date < today
+            ))
+
+            if past_dates:
+                logger.info(f"Resolving pending picks for {len(past_dates)} date(s): {past_dates}")
+                for pick_date in past_dates:
+                    await resolve_all_picks(session, pick_date)
+            else:
+                logger.info("No pending picks to resolve")
 
             # Step 2: Generate today's picks (if not already generated)
             existing_picks = await picks_repo.get_all_by_date(today)

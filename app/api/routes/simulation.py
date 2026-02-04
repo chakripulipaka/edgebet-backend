@@ -10,7 +10,13 @@ from app.db.models import SimulationSnapshot
 from app.db.repositories.picks import PicksRepository
 from app.api.schemas.simulation import SimulationResponse
 from app.services.picks_service import PicksService
-from app.jobs.daily_job import resolve_and_cleanup_picks, resolve_all_picks, run_daily_job, run_hourly_picks_job
+from app.jobs.daily_job import (
+    resolve_and_cleanup_picks,
+    resolve_all_picks,
+    resolve_all_pending_picks,
+    run_daily_job,
+    run_hourly_picks_job,
+)
 
 router = APIRouter()
 
@@ -78,8 +84,8 @@ async def resolve_pending_picks(db: AsyncSession = Depends(get_db)):
     still_pending = 0
 
     for pick_date in dates:
-        # Only process dates within the last 7 days
-        if (datetime.now().date() - pick_date).days > 7:
+        # Skip today/future dates (games may still be in progress)
+        if pick_date >= datetime.now().date():
             continue
 
         await resolve_all_picks(db, pick_date)
@@ -159,6 +165,23 @@ async def trigger_daily_job():
     """
     await run_daily_job()
     return {"message": "Daily job completed successfully"}
+
+
+@router.post("/jobs/catchup")
+async def trigger_catchup():
+    """
+    Trigger the full catch-up process on demand.
+
+    Resolves all pending picks from all past dates, then refreshes
+    the picks snapshot. Use this after the server has been asleep
+    or to manually ensure all data is up to date.
+    """
+    resolved = await resolve_all_pending_picks()
+    await run_hourly_picks_job()
+    return {
+        "message": "Catch-up completed",
+        "picks_resolved": resolved,
+    }
 
 
 @router.post("/jobs/hourly-picks")
