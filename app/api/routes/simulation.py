@@ -9,7 +9,6 @@ from app.db.database import get_db
 from app.db.models import SimulationSnapshot
 from app.db.repositories.picks import PicksRepository
 from app.api.schemas.simulation import SimulationResponse
-from app.services.simulation_service import SimulationService
 from app.services.picks_service import PicksService
 from app.jobs.daily_job import resolve_and_cleanup_picks, resolve_all_picks, run_daily_job, run_hourly_picks_job
 
@@ -41,12 +40,22 @@ async def get_simulation(
         # Return pre-computed data (instant)
         return SimulationResponse(**snapshot.snapshot_data)
 
-    # No snapshot yet - fall back to live calculation
-    # This only happens on first load before any daily job has run
-    sim_service = SimulationService(db)
-    data = await sim_service.run_live_simulation(starting_bankroll)
-
-    return SimulationResponse(**data)
+    # No snapshot yet - return empty simulation data
+    return SimulationResponse(
+        chartData=[],
+        dailySummaries=[],
+        finalBankroll=starting_bankroll,
+        totalWins=0,
+        totalLosses=0,
+        totalPushes=0,
+        winRate=0.0,
+        roi=0.0,
+        maxDrawdown=0.0,
+        peakBankroll=starting_bankroll,
+        daysSimulated=0,
+        totalBets=0,
+        startingBankroll=starting_bankroll,
+    )
 
 
 @router.post("/simulation/resolve-pending")
