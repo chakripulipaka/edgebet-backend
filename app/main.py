@@ -107,6 +107,6 @@ app.include_router(picks.router, tags=["picks"])
 app.include_router(simulation.router, tags=["simulation"])
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     return {"status": "healthy", "environment": settings.ENVIRONMENT}
