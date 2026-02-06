@@ -286,12 +286,13 @@ class PicksService:
             logger.info(f"No games found for {pick_date}")
             return []
 
-        # Filter to scheduled games
+        # Filter to scheduled games only - never process live/final games
         scheduled_games = [g for g in games if g.get("status") in ("scheduled", None)]
         if not scheduled_games:
-            scheduled_games = games
+            logger.info(f"No scheduled games for {pick_date} - all games may be live/final")
+            return []
 
-        logger.info(f"Found {len(scheduled_games)} games for {pick_date}")
+        logger.info(f"Found {len(scheduled_games)} scheduled games for {pick_date}")
 
         # Fetch odds
         try:
@@ -346,6 +347,21 @@ class PicksService:
         away_name = get_team_name(away_team_id)
         home_abbr = get_team_abbreviation(home_team_id)
         away_abbr = get_team_abbreviation(away_team_id)
+
+        # Skip games that have already started or are starting within 5 minutes
+        # This prevents using live in-game odds which are drastically different
+        game_time = game.get("game_time")
+        if game_time:
+            now = datetime.now(EASTERN_TZ)
+            if game_time.tzinfo:
+                game_time_et = game_time.astimezone(EASTERN_TZ)
+            else:
+                game_time_et = game_time.replace(tzinfo=EASTERN_TZ)
+
+            # Lock odds 5 minutes before game time
+            if now >= game_time_et - timedelta(minutes=5):
+                logger.info(f"SKIPPING {away_abbr} @ {home_abbr}: Game starting within 5 minutes or already started")
+                return []
 
         logger.info(f"Processing game: {away_abbr} @ {home_abbr}")
 
