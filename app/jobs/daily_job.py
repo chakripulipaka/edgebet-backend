@@ -532,11 +532,11 @@ if settings.ENVIRONMENT == "production":
         replace_existing=True,
     )
 
-    # Hourly picks refresh at :00 of each hour
-    # Pre-computes picks for instant dashboard loading
+    # Picks refresh every 3 hours to conserve Odds API quota (500 free requests/month)
+    # Runs at 0:00, 3:00, 6:00, 9:00, 12:00, 15:00, 18:00, 21:00 EST (8x/day = 240/month)
     scheduler.add_job(
         run_hourly_picks_job,
-        CronTrigger(minute=0, timezone=EST),  # Every hour at :00
+        CronTrigger(hour='*/3', minute=0, timezone=EST),  # Every 3 hours
         id="hourly_picks_job",
         replace_existing=True,
     )

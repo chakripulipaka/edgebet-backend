@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 # Global cache for odds API with TTL
 _odds_cache: Dict[str, Tuple[float, List[dict]]] = {}
-_ODDS_CACHE_TTL = 300  # 5 minutes TTL for odds cache
+_ODDS_CACHE_TTL = 1800  # 30 minutes TTL to conserve API quota (500 free requests/month)
 
 # Explicit mapping from team abbreviations to The Odds API team names
 ABBREV_TO_ODDS_API_NAME = {
