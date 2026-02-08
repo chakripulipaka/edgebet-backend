@@ -181,71 +181,80 @@ async def run_hourly_picks_job():
                 target_date = (now + timedelta(days=days_ahead)).date()
                 logger.info(f"Processing {target_date} (days ahead: {days_ahead})")
 
-                # Get existing picks for this date
-                existing_picks = await picks_repo.get_all_by_date(target_date)
-
-                # Separate live/final picks from scheduled picks
-                live_final_picks = []
-                scheduled_pick_ids = []
-
-                for pick in existing_picks:
-                    status = picks_service._calculate_game_status(pick.game_time)
-                    if status == "scheduled":
-                        # Will regenerate with fresh odds
-                        scheduled_pick_ids.append(pick.id)
-                    else:
-                        # Keep locked odds for live/final games
-                        formatted = picks_service._format_pick(pick, status)
-                        live_final_picks.append(formatted)
-                        all_games_with_picks.add(pick.espn_game_id)
-
-                # Delete scheduled picks (they'll be regenerated with fresh odds)
-                if scheduled_pick_ids:
-                    await picks_repo.delete_by_ids(scheduled_pick_ids)
-                    logger.info(f"Deleted {len(scheduled_pick_ids)} scheduled picks for {target_date}")
-
-                # Add live/final picks to our collection
-                all_picks.extend(live_final_picks)
-
-                # Generate fresh picks for scheduled games (fetches fresh odds)
-                new_picks = await picks_service.generate_picks_for_date(target_date)
-
-                # Add only scheduled picks (live/final already added above)
-                for pick in new_picks:
-                    if pick.get("gameStatus") == "scheduled":
-                        all_picks.append(pick)
-                        if pick.get("espnGameId"):
-                            all_games_with_picks.add(pick.get("espnGameId"))
-
-                # Get all games from ESPN for this date
+                # Get ESPN games first to get actual game statuses
                 games_on_date = espn_data_service.get_games_for_date(target_date)
+                espn_status_map = {
+                    game.get("nba_game_id"): game.get("status", "scheduled")
+                    for game in games_on_date
+                }
+                logger.info(f"ESPN statuses for {target_date}: {espn_status_map}")
+
+                # Store ESPN games for later (games without picks)
                 for game in games_on_date:
                     all_espn_games.append({
                         "game_id": game.get("nba_game_id"),
                         "home_team_id": game.get("home_team_id"),
                         "away_team_id": game.get("away_team_id"),
                         "game_time": game.get("game_time"),
+                        "status": game.get("status", "scheduled"),
                         "date": target_date,
                     })
+
+                # Get existing picks for this date
+                existing_picks = await picks_repo.get_all_by_date(target_date)
+
+                # Separate picks by ESPN status (not time-based)
+                live_picks = []
+                scheduled_pick_ids = []
+
+                for pick in existing_picks:
+                    # Use ESPN status instead of time-based calculation
+                    espn_status = espn_status_map.get(pick.espn_game_id, "scheduled")
+
+                    if espn_status == "final":
+                        # Game is over - skip (don't include in snapshot)
+                        logger.info(f"Skipping final game pick: {pick.away_team} @ {pick.home_team}")
+                        continue
+                    elif espn_status in ("in_progress", "halftime"):
+                        # Live game - keep locked odds
+                        formatted = picks_service._format_pick(pick, espn_status)
+                        live_picks.append(formatted)
+                        all_games_with_picks.add(pick.espn_game_id)
+                    else:
+                        # Scheduled - will regenerate with fresh odds
+                        scheduled_pick_ids.append(pick.id)
+
+                # Delete scheduled picks (they'll be regenerated with fresh odds)
+                if scheduled_pick_ids:
+                    await picks_repo.delete_by_ids(scheduled_pick_ids)
+                    logger.info(f"Deleted {len(scheduled_pick_ids)} scheduled picks for {target_date}")
+
+                # Add live picks to our collection (final games excluded above)
+                all_picks.extend(live_picks)
+
+                # Generate fresh picks for scheduled games (fetches fresh odds)
+                new_picks = await picks_service.generate_picks_for_date(target_date)
+
+                # Add only scheduled picks (live already added above)
+                for pick in new_picks:
+                    if pick.get("gameStatus") == "scheduled":
+                        all_picks.append(pick)
+                        if pick.get("espnGameId"):
+                            all_games_with_picks.add(pick.get("espnGameId"))
 
             # Find games without picks (scheduled games with no odds available)
             games_without_picks = []
             for game in all_espn_games:
                 game_id = game.get("game_id")
                 game_time = game.get("game_time")
+                espn_status = game.get("status", "scheduled")
 
                 # Skip if we have picks for this game
                 if game_id in all_games_with_picks:
                     continue
 
-                # Calculate game status
-                if game_time:
-                    status = picks_service._calculate_game_status(game_time)
-                else:
-                    status = "scheduled"
-
                 # Only include scheduled games (live/final without picks are edge cases)
-                if status == "scheduled":
+                if espn_status == "scheduled":
                     games_without_picks.append({
                         "homeTeam": get_team_name(game.get("home_team_id")),
                         "awayTeam": get_team_name(game.get("away_team_id")),

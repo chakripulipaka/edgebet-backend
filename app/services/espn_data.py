@@ -121,10 +121,20 @@ class ESPNDataService:
 
             status = self._parse_game_status(competition.get("status", {}))
 
+            # Parse game time from ESPN (UTC format: "2026-02-08T02:00Z")
+            game_time = None
+            date_str = event.get("date")
+            if date_str:
+                try:
+                    # Convert from UTC string to timezone-aware datetime
+                    game_time = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                except (ValueError, AttributeError) as e:
+                    logger.warning(f"Failed to parse game time from '{date_str}': {e}")
+
             return {
                 "nba_game_id": event_id,
                 "game_date": game_date,
-                "game_time": None,
+                "game_time": game_time,
                 "home_team_id": home_team["id"],
                 "away_team_id": away_team["id"],
                 "status": status,
@@ -225,9 +235,18 @@ class ESPNDataService:
             if not home_team or not away_team:
                 return None
 
-            # Parse date
-            date_str = event.get("date", "")[:10]  # YYYY-MM-DD
-            game_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            # Parse game time from ESPN (UTC format: "2026-02-08T02:00Z")
+            game_time = None
+            date_str = event.get("date", "")
+            if date_str:
+                try:
+                    game_time = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                    game_date = game_time.date()
+                except (ValueError, AttributeError):
+                    # Fallback to date-only parsing
+                    game_date = datetime.strptime(date_str[:10], "%Y-%m-%d").date()
+            else:
+                game_date = None
 
             status = self._parse_game_status(competition.get("status", {}))
 
@@ -235,6 +254,7 @@ class ESPNDataService:
                 "nba_game_id": event["id"],
                 "season": season,
                 "game_date": game_date,
+                "game_time": game_time,
                 "status": status,
                 "home_team_id": home_team["id"],
                 "away_team_id": away_team["id"],
