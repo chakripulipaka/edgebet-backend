@@ -235,6 +235,15 @@ async def run_hourly_picks_job():
                 # Generate fresh picks for scheduled games (fetches fresh odds)
                 new_picks = await picks_service.generate_picks_for_date(target_date)
 
+                # Alert if we got 0 picks despite having scheduled games
+                scheduled_games = [g for g in games_on_date if g.get("status") in ("scheduled", None)]
+                if len(scheduled_games) > 0 and len(new_picks) == 0:
+                    logger.error(
+                        f"CRITICAL: 0 picks generated for {target_date} despite {len(scheduled_games)} scheduled games. "
+                        f"This likely means the Odds API key is invalid or quota exhausted. "
+                        f"Check THE_ODDS_API_KEY in Render environment variables."
+                    )
+
                 # Add only scheduled picks (live already added above)
                 for pick in new_picks:
                     if pick.get("gameStatus") == "scheduled":

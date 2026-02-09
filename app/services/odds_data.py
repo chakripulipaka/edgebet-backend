@@ -108,6 +108,21 @@ class OddsDataService:
             )
             response.raise_for_status()
 
+            # Log API quota usage from response headers
+            requests_used = response.headers.get("x-requests-used", "?")
+            requests_remaining = response.headers.get("x-requests-remaining", "?")
+            logger.info(f"Odds API quota: {requests_used} used, {requests_remaining} remaining")
+
+            # Warn if quota is running low
+            try:
+                remaining = int(requests_remaining)
+                if remaining < 50:  # Less than 10% of 500 free tier
+                    logger.error(f"CRITICAL: Odds API quota very low - only {remaining} requests remaining!")
+                elif remaining < 100:  # Less than 20%
+                    logger.warning(f"WARNING: Odds API quota running low - {remaining} requests remaining")
+            except (ValueError, TypeError):
+                pass  # Couldn't parse remaining count
+
             events = response.json()  # Direct array, not wrapped
 
             logger.info(f"Fetched {len(events)} events from Odds API (fresh)")
@@ -129,9 +144,20 @@ class OddsDataService:
 
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 401:
-                logger.error("Invalid Odds API key")
+                # Get response body for more details (quota exhausted vs invalid key)
+                try:
+                    error_body = e.response.json()
+                    error_msg = error_body.get("message", "Unknown error")
+                except Exception:
+                    error_msg = e.response.text[:200] if e.response.text else "No details"
+                logger.error(
+                    f"CRITICAL: Odds API authentication failed (401). "
+                    f"API key may be invalid or quota exhausted. "
+                    f"Response: {error_msg}. "
+                    f"Action: Check THE_ODDS_API_KEY in Render environment variables."
+                )
             else:
-                logger.error(f"Odds API HTTP error: {e.response.status_code}")
+                logger.error(f"Odds API HTTP error: {e.response.status_code} - {e.response.text[:200]}")
             return []
         except httpx.HTTPError as e:
             logger.error(f"Odds API network error: {e}")
