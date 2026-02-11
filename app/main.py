@@ -54,7 +54,9 @@ async def _startup_catchup():
         resolved_count = await resolve_all_pending_picks()
         logger.info(f"Startup catch-up: resolved {resolved_count} pending picks")
 
-        # Step 2: Check if picks snapshot is stale (> 1 hour old)
+        # Step 2: Check if picks snapshot predates the last SCHEDULED run time
+        # Picks only update at 9 AM and 6 PM EST - only catch up if one was missed
+        # This prevents spurious refreshes when Render restarts mid-day
         async with async_session_factory() as session:
             result = await session.execute(
                 select(PicksSnapshot)
@@ -64,20 +66,39 @@ async def _startup_catchup():
             latest_snapshot = result.scalar_one_or_none()
 
             now = datetime.now(EST)
-            snapshot_stale = True
+            today_9am = now.replace(hour=9, minute=0, second=0, microsecond=0)
+            today_6pm = now.replace(hour=18, minute=0, second=0, microsecond=0)
 
-            if latest_snapshot and latest_snapshot.computed_at:
-                snapshot_age = now - latest_snapshot.computed_at.astimezone(EST)
-                snapshot_stale = snapshot_age > timedelta(hours=1)
-                logger.info(f"Latest picks snapshot age: {snapshot_age}, stale: {snapshot_stale}")
+            # Find the most recent scheduled time that has already passed today
+            if now >= today_6pm:
+                last_scheduled = today_6pm
+            elif now >= today_9am:
+                last_scheduled = today_9am
+            else:
+                last_scheduled = None  # Before 9 AM, nothing to catch up
+
+            snapshot_stale = True  # default
+
+            if last_scheduled is None:
+                # Before 9 AM, no scheduled run has occurred yet today
+                snapshot_stale = False
+                logger.info("Before 9 AM - no catch-up needed")
+            elif latest_snapshot and latest_snapshot.computed_at:
+                snapshot_time = latest_snapshot.computed_at.astimezone(EST)
+                snapshot_stale = snapshot_time < last_scheduled
+                logger.info(f"Last scheduled: {last_scheduled.strftime('%I:%M %p')}, "
+                            f"snapshot: {snapshot_time.strftime('%I:%M %p')}, stale: {snapshot_stale}")
             else:
                 logger.info("No picks snapshot found - will regenerate")
+                snapshot_stale = True
 
-        # Step 3: Refresh hourly picks snapshot if stale
+        # Step 3: Refresh picks snapshot only if a scheduled run was missed
         if snapshot_stale:
-            logger.info("Refreshing picks snapshot (stale or missing)...")
+            logger.info("Refreshing picks snapshot (scheduled run was missed)...")
             await run_hourly_picks_job()
             logger.info("Picks snapshot refreshed")
+        else:
+            logger.info("Picks snapshot is current - no refresh needed")
 
         logger.info("=== STARTUP CATCH-UP COMPLETE ===")
 
