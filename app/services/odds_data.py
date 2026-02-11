@@ -85,7 +85,9 @@ class OddsDataService:
             return []
 
         # Check cache first (unless force refresh)
-        cache_key = str(game_date or "all")
+        # Use fixed key since API returns ALL upcoming games regardless of date param
+        # This ensures 1 API call serves all dates (today, tomorrow, etc.)
+        cache_key = "nba_odds"
         now = time.time()
 
         if not force_refresh and cache_key in _odds_cache:

@@ -541,11 +541,22 @@ if settings.ENVIRONMENT == "production":
         replace_existing=True,
     )
 
-    # Picks refresh every 3 hours to conserve Odds API quota (500 free requests/month)
-    # Runs at 0:00, 3:00, 6:00, 9:00, 12:00, 15:00, 18:00, 21:00 EST (8x/day = 240/month)
+    # Picks refresh twice daily to minimize Odds API usage (500 free requests/month)
+    # With unified cache key, each job run makes only 1 API call regardless of how many dates
+    # 2 runs/day × 1 call = 2 calls/day = 60 calls/month (12% of free tier)
+
+    # 9 AM EST - morning picks with opening odds
     scheduler.add_job(
         run_hourly_picks_job,
-        CronTrigger(hour='*/3', minute=0, timezone=EST),  # Every 3 hours
-        id="hourly_picks_job",
+        CronTrigger(hour=9, minute=0, timezone=EST),
+        id="morning_picks_job",
+        replace_existing=True,
+    )
+
+    # 6 PM EST - pre-game odds update (1 hour before typical NBA tip-off)
+    scheduler.add_job(
+        run_hourly_picks_job,
+        CronTrigger(hour=18, minute=0, timezone=EST),
+        id="evening_picks_job",
         replace_existing=True,
     )
